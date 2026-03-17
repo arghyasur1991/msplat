@@ -42,7 +42,8 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    MTensor &filter_3d
 );
 
 // Fused forward + backward + Adam + grad_stats in one encoder
@@ -63,8 +64,54 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    MTensor &filter_3d
 );
+
+// Compute per-Gaussian 3D smoothing filter (max focal/depth across views)
+void msplat_compute_3d_filter(int N, MTensor &means3d, MTensor &viewmat,
+                              float fx, float fy, MTensor &filter_3d);
+
+// MCMC: Langevin noise injection on Gaussian means
+void msplat_sgld_noise(int N, MTensor &means, MTensor &scales, MTensor &quats,
+                       MTensor &opacities, MTensor &rng_states,
+                       float noise_lr, float xyz_lr);
+
+// MCMC: classify dead Gaussians and compute alive opacity
+void msplat_mcmc_classify_dead(int N, MTensor &opacities, MTensor &dead_flag,
+                               MTensor &alive_opacity, float dead_thresh);
+
+// MCMC: relocate dead Gaussians by sampling from alive set
+void msplat_mcmc_relocate(int N, MTensor &dead_flag, MTensor &alive_prefix_sum,
+                          float total_alive_weight,
+                          MTensor &means_buf, MTensor &scales_buf,
+                          MTensor &quats_buf, MTensor &featuresDc_buf,
+                          MTensor &featuresRest_buf, MTensor &opacities_buf,
+                          int fr_stride, MTensor &rng_states,
+                          MTensor adam_ea[], MTensor adam_es[]);
+
+// MCMC: L1 regularization loss on scales and opacities
+void msplat_mcmc_reg_loss(int N, MTensor &scales, MTensor &opacities,
+                          MTensor &reg_out);
+
+// Bilateral grid: forward slice (apply per-pixel affine color correction)
+void msplat_bilateral_slice_forward(MTensor &rendered_img, MTensor &grid,
+                                    MTensor &corrected_img,
+                                    unsigned width, unsigned height,
+                                    int grid_X, int grid_Y, int grid_W);
+
+// Bilateral grid: backward slice + grid gradient scatter
+void msplat_bilateral_slice_backward(MTensor &rendered_img, MTensor &grid,
+                                     MTensor &dL_d_corrected,
+                                     MTensor &dL_d_rendered, MTensor &dL_d_grid,
+                                     unsigned width, unsigned height,
+                                     int grid_X, int grid_Y, int grid_W);
+
+// Bilateral grid: total variation regularization loss + gradient
+void msplat_bilateral_tv_loss(MTensor &grid, MTensor &tv_loss,
+                              MTensor &dL_d_grid,
+                              int grid_X, int grid_Y, int grid_W,
+                              float tv_weight);
 
 int msplat_densify(
     int N, int buf_capacity,

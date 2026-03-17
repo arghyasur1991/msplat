@@ -356,10 +356,40 @@ void Model::afterTrainMCMC(int step) {
 
     if (step % refineEvery != 0 || step <= warmupLength) return;
 
-    // TODO: dispatch mcmc_classify_dead_kernel
-    // TODO: prefix sum of alive_opacity -> alive_prefix_sum
-    // TODO: dispatch mcmc_relocate_kernel
-    fprintf(stderr, "MCMC relocation at step %d (N=%d)\n", step, num_active);
+    int N = num_active;
+    fprintf(stderr, "MCMC relocation at step %d (N=%d)\n", step, N);
+
+    // Zero out buffers before classify
+    memset(dead_flag.data_ptr(), 0, dead_flag.nbytes());
+    memset(alive_opacity.data_ptr(), 0, alive_opacity.nbytes());
+    memset(alive_prefix_sum.data_ptr(), 0, alive_prefix_sum.nbytes());
+
+    msplat_mcmc_classify_dead(N, opacities, dead_flag, alive_opacity,
+                              mcmc_dead_thresh);
+    msplat_gpu_sync();
+
+    // CPU prefix sum over alive_opacity -> alive_prefix_sum
+    float* alive_op = alive_opacity.data<float>();
+    float* prefix = alive_prefix_sum.data<float>();
+    prefix[0] = alive_op[0];
+    for (int i = 1; i < N; i++) {
+        prefix[i] = prefix[i - 1] + alive_op[i];
+    }
+    float total_alive_weight = prefix[N - 1];
+
+    if (total_alive_weight > 0.0f) {
+        int fr_stride = (int)featuresRest.size(-2);
+        msplat_mcmc_relocate(N, dead_flag, alive_prefix_sum, total_alive_weight,
+                             means, scales, quats, featuresDc, featuresRest,
+                             opacities, fr_stride, rng_states,
+                             adam_exp_avg, adam_exp_avg_sq);
+        msplat_commit();
+    }
+
+    // Regularization loss (computed but applied in loss function)
+    memset(reg_out.data_ptr(), 0, reg_out.nbytes());
+    msplat_mcmc_reg_loss(N, scales, opacities, reg_out);
+    msplat_commit();
 }
 
 void Model::save(const std::string &filename, int step) {
@@ -600,6 +630,21 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
     return s;
 }
 
+void Model::compute3DFilter(std::vector<Camera>& cameras) {
+    if (!use_3d_filter || !filter_3d.defined()) return;
+
+    // Zero the filter before computing max across all views
+    memset(filter_3d.data_ptr(), 0, filter_3d.nbytes());
+
+    int N = num_active;
+    for (auto& cam : cameras) {
+        auto s = prepareCam(cam, 0);
+        msplat_compute_3d_filter(N, means, cam.cachedViewMat, s.fx, s.fy,
+                                 filter_3d);
+    }
+    msplat_gpu_sync();
+}
+
 MTensor Model::render(Camera& cam, int step){
     auto s = prepareCam(cam, step);
     return msplat_render(
@@ -607,7 +652,7 @@ MTensor Model::render(Camera& cam, int step){
         quats, cam.cachedViewMat, cam.cachedProjViewMat, s.fx, s.fy, s.cx, s.cy,
         s.height, s.width, s.tileBounds, 0.01f,
         s.degree, s.degreesToUse, s.cam_pos, featuresDc, featuresRest,
-        opacities, backgroundColor);
+        opacities, backgroundColor, filter_3d);
 }
 
 void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
@@ -664,12 +709,14 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         adam_p, adam_ea, adam_eas,
         adam_ss, adam_bc2s,
         adam_beta1, adam_beta2, adam_eps,
-        visCounts, xysGradNorm, max2DSize, invMaxDim);
+        visCounts, xysGradNorm, max2DSize, invMaxDim,
+        filter_3d);
 
     radii = r;
 
-    // MCMC: SGLD noise injection after Adam step
     if (strategy == TrainingStrategy::MCMC && rng_states.defined()) {
-        // TODO: dispatch sgld_noise_kernel
+        msplat_sgld_noise(numPoints, means, scales, quats, opacities,
+                          rng_states, mcmc_noise_lr, adam_lr[0]);
+        msplat_commit();
     }
 }

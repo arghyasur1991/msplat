@@ -4088,7 +4088,7 @@ kernel void bilateral_slice_backward_kernel(
     float dL_affine[12];
     for (int r = 0; r < 3; r++)
         for (int c = 0; c < 4; c++)
-            dL_affine[r*4+c] = ((float*)&dL_out)[r] * rgb1[c];
+            dL_affine[r*4+c] = dL_out[r] * rgb1[c];
 
     float weights[8] = {
         (1-fx)*(1-fy)*(1-fz), fx*(1-fy)*(1-fz),

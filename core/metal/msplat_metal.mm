@@ -160,6 +160,17 @@ struct MetalContext {
     id<MTLComputePipelineState> densify_cull_classify_kernel_cpso;
     id<MTLComputePipelineState> compact_scatter_kernel_cpso;
     id<MTLComputePipelineState> compact_copy_back_kernel_cpso;
+    // 3D smoothing filter
+    id<MTLComputePipelineState> compute_3d_filter_kernel_cpso;
+    // MCMC kernels
+    id<MTLComputePipelineState> sgld_noise_kernel_cpso;
+    id<MTLComputePipelineState> mcmc_classify_dead_kernel_cpso;
+    id<MTLComputePipelineState> mcmc_relocate_kernel_cpso;
+    id<MTLComputePipelineState> mcmc_reg_loss_kernel_cpso;
+    // Bilateral grid kernels
+    id<MTLComputePipelineState> bilateral_slice_forward_kernel_cpso;
+    id<MTLComputePipelineState> bilateral_slice_backward_kernel_cpso;
+    id<MTLComputePipelineState> bilateral_tv_loss_kernel_cpso;
 };
 
 // Explicit metallib path (set by Swift/Python wrappers before first use)
@@ -263,6 +274,17 @@ MetalContext* init_msplat_metal_context() {
     ctx->densify_cull_classify_kernel_cpso        = load(@"densify_cull_classify_kernel");
     ctx->compact_scatter_kernel_cpso              = load(@"compact_scatter_kernel");
     ctx->compact_copy_back_kernel_cpso            = load(@"compact_copy_back_kernel");
+    // 3D smoothing filter
+    ctx->compute_3d_filter_kernel_cpso            = load(@"compute_3d_filter_kernel");
+    // MCMC
+    ctx->sgld_noise_kernel_cpso                   = load(@"sgld_noise_kernel");
+    ctx->mcmc_classify_dead_kernel_cpso           = load(@"mcmc_classify_dead_kernel");
+    ctx->mcmc_relocate_kernel_cpso                = load(@"mcmc_relocate_kernel");
+    ctx->mcmc_reg_loss_kernel_cpso                = load(@"mcmc_reg_loss_kernel");
+    // Bilateral grid
+    ctx->bilateral_slice_forward_kernel_cpso      = load(@"bilateral_slice_forward_kernel");
+    ctx->bilateral_slice_backward_kernel_cpso     = load(@"bilateral_slice_backward_kernel");
+    ctx->bilateral_tv_loss_kernel_cpso            = load(@"bilateral_tv_loss_kernel");
 
     [metal_library release];
 
@@ -352,6 +374,7 @@ struct FusedTensorCache {
     // Forward intermediates
     MTensor xys, depths, radii_out, conics, num_tiles_hit, colors, aabb;
     MTensor opac_compensations;
+    MTensor filter_3d_zero;
     MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
@@ -393,6 +416,7 @@ struct FusedTensorCache {
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
             opac_compensations = mtensor_empty(dev, {np}, DType::Float32);
+            filter_3d_zero = gpu_zeros({(int64_t)np}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
         }
         if (cap != capacity) {
@@ -471,7 +495,8 @@ static void forward_pipeline(
     MTensor &features_dc, MTensor &features_rest,
     MTensor &opacities, MTensor &background,
     MTensor &gt, MTensor &window2d, float ssim_weight,
-    bool compute_loss
+    bool compute_loss,
+    MTensor &filter_3d
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -506,6 +531,7 @@ static void forward_pipeline(
     MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
+    MTensor &opac_compensations = g_tcache.opac_compensations;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
@@ -571,6 +597,11 @@ static void forward_pipeline(
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
         ENC_BUF(enc, opac_compensations, 23);
+        if (filter_3d.defined()) {
+            ENC_BUF(enc, filter_3d, 24);
+        } else {
+            ENC_BUF(enc, g_tcache.filter_3d_zero, 24);
+        }
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -760,14 +791,15 @@ MTensor msplat_render(
     const std::tuple<int, int, int> tile_bounds, float clip_thresh,
     unsigned degree, unsigned degrees_to_use, float cam_pos[3],
     MTensor &features_dc, MTensor &features_rest,
-    MTensor &opacities, MTensor &background
+    MTensor &opacities, MTensor &background,
+    MTensor &filter_3d
 ) {
     MTensor dummyGt, dummyWindow;
     forward_pipeline(num_points, means3d, scales, glob_scale,
         quats, viewmat, projmat, fx, fy, cx, cy,
         img_height, img_width, tile_bounds, clip_thresh,
         degree, degrees_to_use, cam_pos, features_dc, features_rest,
-        opacities, background, dummyGt, dummyWindow, 0.0f, false);
+        opacities, background, dummyGt, dummyWindow, 0.0f, false, filter_3d);
     return g_tcache.out_img;
 }
 
@@ -787,7 +819,8 @@ std::tuple<MTensor, float> msplat_train_step(
     float adam_step_sizes[], float adam_bc2_sqrts[],
     float adam_beta1, float adam_beta2, float adam_eps,
     MTensor &vis_counts, MTensor &xys_grad_norm, MTensor &max_2d_size,
-    float inv_max_dim
+    float inv_max_dim,
+    MTensor &filter_3d
 ) {
     MetalContext* ctx = get_global_context();
     int tile_bounds_x = std::get<0>(tile_bounds);
@@ -824,6 +857,7 @@ std::tuple<MTensor, float> msplat_train_step(
     MTensor &num_tiles_hit = g_tcache.num_tiles_hit;
     MTensor &colors = g_tcache.colors;
     MTensor &aabb = g_tcache.aabb;
+    MTensor &opac_compensations = g_tcache.opac_compensations;
     MTensor &gaussian_ids = g_tcache.gaussian_ids;
     MTensor &tile_bins = g_tcache.tile_bins;
     MTensor &loss_sum = g_tcache.loss_sum;
@@ -915,6 +949,11 @@ std::tuple<MTensor, float> msplat_train_step(
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
         ENC_BUF(enc, opac_compensations, 23);
+        if (filter_3d.defined()) {
+            ENC_BUF(enc, filter_3d, 24);
+        } else {
+            ENC_BUF(enc, g_tcache.filter_3d_zero, 24);
+        }
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -1117,6 +1156,11 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBuffer:adam_exp_avg[4].buffer() offset:0 atIndex:25]; // rest exp_avg
         [enc setBuffer:adam_exp_avg_sq[4].buffer() offset:0 atIndex:26]; // rest exp_avg_sq
         [enc setBytes:sh_adam_hp.get() length:sizeof(SHAdamParams) atIndex:27];
+        if (filter_3d.defined()) {
+            ENC_BUF(enc, filter_3d, 28);
+        } else {
+            ENC_BUF(enc, g_tcache.filter_3d_zero, 28);
+        }
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
         // Adam for remaining groups (skip 3=featuresDc, 4=featuresRest — fused above)
         if (num_adam_groups > 0) {
@@ -1593,4 +1637,174 @@ int msplat_densify(
     ctx->syncCB();
     int new_count = keep_prefix.data<int32_t>()[worst_case - 1];
     return new_count;
+}
+
+// ========================== 3D FILTER ==========================
+
+void msplat_compute_3d_filter(int N, MTensor &means3d, MTensor &viewmat,
+                              float fx, float fy, MTensor &filter_3d) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    NSUInteger tpg = MIN(ctx->compute_3d_filter_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+    [enc setComputePipelineState:ctx->compute_3d_filter_kernel_cpso];
+    ENC_BUF(enc, means3d, 0);
+    ENC_BUF(enc, viewmat, 1);
+    float focal[2] = {fx, fy};
+    [enc setBytes:focal length:sizeof(focal) atIndex:2];
+    ENC_BUF(enc, filter_3d, 3);
+    ENC_SCALAR(enc, N, 4);
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+}
+
+// ========================== MCMC ==========================
+
+void msplat_sgld_noise(int N, MTensor &means, MTensor &scales, MTensor &quats,
+                       MTensor &opacities, MTensor &rng_states,
+                       float noise_lr, float xyz_lr) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    NSUInteger tpg = MIN(ctx->sgld_noise_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+    [enc setComputePipelineState:ctx->sgld_noise_kernel_cpso];
+    ENC_BUF(enc, means, 0);
+    ENC_BUF(enc, scales, 1);
+    ENC_BUF(enc, quats, 2);
+    ENC_BUF(enc, opacities, 3);
+    ENC_BUF(enc, rng_states, 4);
+    ENC_SCALAR(enc, N, 5);
+    ENC_SCALAR(enc, noise_lr, 6);
+    ENC_SCALAR(enc, xyz_lr, 7);
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+}
+
+void msplat_mcmc_classify_dead(int N, MTensor &opacities, MTensor &dead_flag,
+                               MTensor &alive_opacity, float dead_thresh) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    NSUInteger tpg = MIN(ctx->mcmc_classify_dead_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+    [enc setComputePipelineState:ctx->mcmc_classify_dead_kernel_cpso];
+    ENC_BUF(enc, opacities, 0);
+    ENC_BUF(enc, dead_flag, 1);
+    ENC_BUF(enc, alive_opacity, 2);
+    ENC_SCALAR(enc, N, 3);
+    ENC_SCALAR(enc, dead_thresh, 4);
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+}
+
+void msplat_mcmc_relocate(int N, MTensor &dead_flag, MTensor &alive_prefix_sum,
+                          float total_alive_weight,
+                          MTensor &means_buf, MTensor &scales_buf,
+                          MTensor &quats_buf, MTensor &featuresDc_buf,
+                          MTensor &featuresRest_buf, MTensor &opacities_buf,
+                          int fr_stride, MTensor &rng_states,
+                          MTensor adam_ea[], MTensor adam_es[]) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    NSUInteger tpg = MIN(ctx->mcmc_relocate_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+    [enc setComputePipelineState:ctx->mcmc_relocate_kernel_cpso];
+    ENC_BUF(enc, dead_flag, 0);
+    ENC_BUF(enc, alive_prefix_sum, 1);
+    ENC_SCALAR(enc, total_alive_weight, 2);
+    ENC_BUF(enc, means_buf, 3);
+    ENC_BUF(enc, scales_buf, 4);
+    ENC_BUF(enc, quats_buf, 5);
+    ENC_BUF(enc, featuresDc_buf, 6);
+    ENC_BUF(enc, featuresRest_buf, 7);
+    ENC_BUF(enc, opacities_buf, 8);
+    ENC_SCALAR(enc, fr_stride, 9);
+    ENC_BUF(enc, rng_states, 10);
+    for (int g = 0; g < 6; g++) {
+        [enc setBuffer:adam_ea[g].buffer() offset:0 atIndex:11 + g];
+    }
+    for (int g = 0; g < 6; g++) {
+        [enc setBuffer:adam_es[g].buffer() offset:0 atIndex:17 + g];
+    }
+    ENC_SCALAR(enc, N, 23);
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+}
+
+void msplat_mcmc_reg_loss(int N, MTensor &scales, MTensor &opacities,
+                          MTensor &reg_out) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    NSUInteger tpg = MIN(ctx->mcmc_reg_loss_kernel_cpso.maxTotalThreadsPerThreadgroup, (NSUInteger)N);
+    [enc setComputePipelineState:ctx->mcmc_reg_loss_kernel_cpso];
+    ENC_BUF(enc, scales, 0);
+    ENC_BUF(enc, opacities, 1);
+    ENC_SCALAR(enc, N, 2);
+    ENC_BUF(enc, reg_out, 3);
+    [enc dispatchThreads:MTLSizeMake(N, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
+    [enc endEncoding];
+}
+
+// ========================== BILATERAL GRID ==========================
+
+void msplat_bilateral_slice_forward(MTensor &rendered_img, MTensor &grid,
+                                    MTensor &corrected_img,
+                                    unsigned width, unsigned height,
+                                    int grid_X, int grid_Y, int grid_W) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->bilateral_slice_forward_kernel_cpso];
+    ENC_BUF(enc, rendered_img, 0);
+    ENC_BUF(enc, grid, 1);
+    ENC_BUF(enc, corrected_img, 2);
+    uint32_t img_size[2] = {width, height};
+    [enc setBytes:img_size length:sizeof(img_size) atIndex:3];
+    uint32_t grid_dims[3] = {(uint32_t)grid_X, (uint32_t)grid_Y, (uint32_t)grid_W};
+    [enc setBytes:grid_dims length:sizeof(grid_dims) atIndex:4];
+    [enc dispatchThreads:MTLSizeMake(width, height, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [enc endEncoding];
+}
+
+void msplat_bilateral_slice_backward(MTensor &rendered_img, MTensor &grid,
+                                     MTensor &dL_d_corrected,
+                                     MTensor &dL_d_rendered, MTensor &dL_d_grid,
+                                     unsigned width, unsigned height,
+                                     int grid_X, int grid_Y, int grid_W) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->bilateral_slice_backward_kernel_cpso];
+    ENC_BUF(enc, rendered_img, 0);
+    ENC_BUF(enc, grid, 1);
+    ENC_BUF(enc, dL_d_corrected, 2);
+    ENC_BUF(enc, dL_d_rendered, 3);
+    ENC_BUF(enc, dL_d_grid, 4);
+    uint32_t img_size[2] = {width, height};
+    [enc setBytes:img_size length:sizeof(img_size) atIndex:5];
+    uint32_t grid_dims[3] = {(uint32_t)grid_X, (uint32_t)grid_Y, (uint32_t)grid_W};
+    [enc setBytes:grid_dims length:sizeof(grid_dims) atIndex:6];
+    [enc dispatchThreads:MTLSizeMake(width, height, 1)
+        threadsPerThreadgroup:MTLSizeMake(16, 16, 1)];
+    [enc endEncoding];
+}
+
+void msplat_bilateral_tv_loss(MTensor &grid, MTensor &tv_loss,
+                              MTensor &dL_d_grid,
+                              int grid_X, int grid_Y, int grid_W,
+                              float tv_weight) {
+    MetalContext* ctx = get_global_context();
+    id<MTLCommandBuffer> cb = ctx->getCommandBuffer();
+    id<MTLComputeCommandEncoder> enc = [cb computeCommandEncoder];
+    [enc setComputePipelineState:ctx->bilateral_tv_loss_kernel_cpso];
+    ENC_BUF(enc, grid, 0);
+    ENC_BUF(enc, tv_loss, 1);
+    ENC_BUF(enc, dL_d_grid, 2);
+    uint32_t grid_dims[3] = {(uint32_t)grid_X, (uint32_t)grid_Y, (uint32_t)grid_W};
+    [enc setBytes:grid_dims length:sizeof(grid_dims) atIndex:3];
+    ENC_SCALAR(enc, tv_weight, 4);
+    [enc dispatchThreads:MTLSizeMake(grid_X, grid_Y, grid_W)
+        threadsPerThreadgroup:MTLSizeMake(MIN(grid_X, 16u), MIN(grid_Y, 16u), 1)];
+    [enc endEncoding];
 }

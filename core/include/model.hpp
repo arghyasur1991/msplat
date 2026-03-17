@@ -46,6 +46,7 @@ struct Model{
   CamSetup prepareCam(Camera& cam, int step);
   void fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight);
   MTensor render(Camera& cam, int step);
+  void compute3DFilter(std::vector<Camera>& cameras);
 
   MTensor means;
   MTensor scales;

@@ -161,6 +161,7 @@ int main(int argc, char *argv[]) {
         if (use3dFilter) {
             model.use_3d_filter = true;
             model.filter_3d = gpu_zeros({(int64_t)model.num_active}, DType::Float32);
+            model.compute3DFilter(cams);
         }
 
         if (useBilateralGrid) {
