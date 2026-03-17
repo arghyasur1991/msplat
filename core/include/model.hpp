@@ -10,12 +10,15 @@ int numShBases(int degree);
 float psnr(const MTensor& rendered, const MTensor& gt);
 float l1_loss(const MTensor& rendered, const MTensor& gt);
 
+enum class TrainingStrategy { Default, MCMC };
+
 struct Model{
   Model(const InputData &inputData, int numCameras,
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
         bool randomBackground = true, int stopSplitAtOverride = -1,
+        TrainingStrategy strategy = TrainingStrategy::Default,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -26,6 +29,8 @@ struct Model{
   void schedulersStep(int step);
   int getDownscaleFactor(int step);
   void afterTrain(int step);
+  void afterTrainMCMC(int step);
+  void initMCMCBuffers();
   void save(const std::string &filename, int step);
   void savePly(const std::string &filename, int step);
   void saveSplat(const std::string &filename);
@@ -97,6 +102,20 @@ struct Model{
   int maxSteps;
   bool keepCrs;
   bool randomBackground = true;
+
+  TrainingStrategy strategy = TrainingStrategy::Default;
+  float mcmc_noise_lr = 5e5f;
+  float mcmc_dead_thresh = 0.005f;
+  float mcmc_scale_reg = 0.01f;
+  float mcmc_opacity_reg = 0.01f;
+  int mcmc_cap_max = 1000000;
+
+  // MCMC state buffers
+  MTensor rng_states;      // [N] uint2 per-gaussian RNG
+  MTensor dead_flag;       // [N] int32
+  MTensor alive_opacity;   // [N] float — for multinomial sampling
+  MTensor alive_prefix_sum; // [N] float — prefix sum of alive opacities
+  MTensor reg_out;          // [2] float — scale_reg_sum, opacity_reg_sum
 
   std::mt19937 bgRng{42};
 

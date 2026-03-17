@@ -45,13 +45,15 @@ Model::Model(const InputData &inputData, int numCameras,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs,
     bool randomBackground, int stopSplitAtOverride,
+    TrainingStrategy strategy,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs), randomBackground(randomBackground) {
+      maxSteps(maxSteps), keepCrs(keepCrs), randomBackground(randomBackground),
+      strategy(strategy) {
 
     if (stopSplitAtOverride >= 0) stopSplitAt = stopSplitAtOverride;
 
@@ -117,6 +119,10 @@ Model::Model(const InputData &inputData, int numCameras,
     static const float defaultBg[3] = {0.6130f, 0.0101f, 0.3984f};
     memcpy(backgroundColor.data_ptr(), bgColor ? bgColor : defaultBg, 3 * sizeof(float));
     setupOptimizers();
+
+    if (strategy == TrainingStrategy::MCMC) {
+        initMCMCBuffers();
+    }
 }
 
 void Model::setupOptimizers(){
@@ -237,6 +243,11 @@ int Model::getDownscaleFactor(int step) {
 }
 
 void Model::afterTrain(int step){
+    if (strategy == TrainingStrategy::MCMC) {
+        afterTrainMCMC(step);
+        return;
+    }
+
     if (!radii.defined()) return;
 
     if (step % refineEvery == 0 && step > warmupLength){
@@ -296,6 +307,31 @@ void Model::afterTrain(int step){
         visCounts.reset();
         max2DSize.reset();
     }
+}
+
+void Model::initMCMCBuffers() {
+    int N = num_active;
+    rng_states = gpu_empty({N, 2}, DType::Int32);
+    uint32_t *rng_ptr = (uint32_t*)rng_states.data_ptr();
+    for (int i = 0; i < N; i++) {
+        rng_ptr[i * 2] = (uint32_t)(i * 747796405u + 2891336453u);
+        rng_ptr[i * 2 + 1] = (uint32_t)(i * 277803737u + 1u) | 1u;
+    }
+    dead_flag = gpu_zeros({N}, DType::Int32);
+    alive_opacity = gpu_zeros({N}, DType::Float32);
+    alive_prefix_sum = gpu_zeros({N}, DType::Float32);
+    reg_out = gpu_zeros({2}, DType::Float32);
+}
+
+void Model::afterTrainMCMC(int step) {
+    if (!radii.defined()) return;
+
+    if (step % refineEvery != 0 || step <= warmupLength) return;
+
+    // TODO: dispatch mcmc_classify_dead_kernel
+    // TODO: prefix sum of alive_opacity -> alive_prefix_sum
+    // TODO: dispatch mcmc_relocate_kernel
+    fprintf(stderr, "MCMC relocation at step %d (N=%d)\n", step, num_active);
 }
 
 void Model::save(const std::string &filename, int step) {
@@ -603,4 +639,9 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         visCounts, xysGradNorm, max2DSize, invMaxDim);
 
     radii = r;
+
+    // MCMC: SGLD noise injection after Adam step
+    if (strategy == TrainingStrategy::MCMC && rng_states.defined()) {
+        // TODO: dispatch sgld_noise_kernel
+    }
 }

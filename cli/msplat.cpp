@@ -96,6 +96,16 @@ int main(int argc, char *argv[]) {
     std::string colmapImagePath;
     app.add_option("--colmap-image-path", colmapImagePath, "Override COLMAP image directory");
 
+    std::string strategyStr = "default";
+    app.add_option("--strategy", strategyStr, "Training strategy: default or mcmc")
+        ->check(CLI::IsMember({"default", "mcmc"}, CLI::ignore_case));
+    float mcmcNoiseLr = 5e5f;
+    app.add_option("--mcmc-noise-lr", mcmcNoiseLr, "MCMC SGLD noise learning rate");
+    float mcmcScaleReg = 0.01f;
+    app.add_option("--mcmc-scale-reg", mcmcScaleReg, "MCMC L1 scale regularization weight");
+    float mcmcOpacityReg = 0.01f;
+    app.add_option("--mcmc-opacity-reg", mcmcOpacityReg, "MCMC L1 opacity regularization weight");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -121,13 +131,22 @@ int main(int argc, char *argv[]) {
             cams = train; valCam = val;
         }
 
+        TrainingStrategy strategy = (strategyStr == "mcmc") ? TrainingStrategy::MCMC : TrainingStrategy::Default;
+
         Model model(inputData, cams.size(),
                      numDownscales, resolutionSchedule, shDegree, shDegreeInterval,
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
                      randomBg, stopSplitAt,
+                     strategy,
                      bgColor.data());
+
+        if (strategy == TrainingStrategy::MCMC) {
+            model.mcmc_noise_lr = mcmcNoiseLr;
+            model.mcmc_scale_reg = mcmcScaleReg;
+            model.mcmc_opacity_reg = mcmcOpacityReg;
+        }
 
         std::vector<size_t> camIndices(cams.size());
         std::iota(camIndices.begin(), camIndices.end(), 0);

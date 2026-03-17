@@ -3767,3 +3767,184 @@ kernel void zero_buffer_kernel(
 ) {
     if (idx < count) buf[idx] = 0;
 }
+
+// ===== MCMC Training Strategy Kernels =====
+// Based on 3DGS-MCMC (NeurIPS 2024): replace heuristic split/clone/cull with
+// principled SGLD sampling and opacity-weighted relocation.
+
+// PCG random number generator (Permuted Congruential Generator)
+// Compact per-thread RNG with excellent statistical properties.
+struct PCGState {
+    uint2 state;
+};
+
+inline uint pcg_next(thread PCGState& rng) {
+    uint old = rng.state.x;
+    rng.state.x = old * 747796405u + rng.state.y;
+    uint word = ((old >> ((old >> 28u) + 4u)) ^ old) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+
+inline float pcg_float(thread PCGState& rng) {
+    return float(pcg_next(rng)) / 4294967296.0f;
+}
+
+inline float pcg_normal(thread PCGState& rng) {
+    float u1 = max(pcg_float(rng), 1e-7f);
+    float u2 = pcg_float(rng);
+    return sqrt(-2.0f * log(u1)) * cos(2.0f * 3.14159265f * u2);
+}
+
+// SGLD noise injection kernel: add Langevin noise to mean positions after Adam step.
+// Noise is gated by opacity (low-opacity Gaussians get more noise → exploration).
+// noise = gate * noise_lr * xyz_lr * Sigma @ randn(3)
+kernel void sgld_noise_kernel(
+    device float* means           [[buffer(0)]],
+    constant float* scales        [[buffer(1)]],
+    constant float* quats         [[buffer(2)]],
+    constant float* opacities     [[buffer(3)]],
+    device uint2* rng_states      [[buffer(4)]],
+    constant int& N               [[buffer(5)]],
+    constant float& noise_lr      [[buffer(6)]],
+    constant float& xyz_lr        [[buffer(7)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+
+    float raw_opac = opacities[idx];
+    float opacity = 1.0f / (1.0f + exp(-raw_opac));
+    float gate = 1.0f / (1.0f + exp(-100.0f * (0.995f - opacity)));
+
+    if (gate < 0.001f) return;
+
+    PCGState rng = {rng_states[idx]};
+    float3 noise = float3(pcg_normal(rng), pcg_normal(rng), pcg_normal(rng));
+    rng_states[idx] = rng.state;
+
+    float3 scale = exp(float3(scales[idx*3], scales[idx*3+1], scales[idx*3+2]));
+    float4 q = float4(quats[idx*4], quats[idx*4+1], quats[idx*4+2], quats[idx*4+3]);
+    float qlen = length(q);
+    q /= qlen;
+
+    // Rotation matrix from quaternion (row-major)
+    float r = q.x, x = q.y, y = q.z, z = q.w;
+    float R00 = 1-2*(y*y+z*z), R01 = 2*(x*y-r*z), R02 = 2*(x*z+r*y);
+    float R10 = 2*(x*y+r*z), R11 = 1-2*(x*x+z*z), R12 = 2*(y*z-r*x);
+    float R20 = 2*(x*z-r*y), R21 = 2*(y*z+r*x), R22 = 1-2*(x*x+y*y);
+
+    // Transform noise by covariance: R @ diag(scale) @ noise
+    float3 scaled = noise * scale;
+    float3 transformed = float3(
+        R00 * scaled.x + R01 * scaled.y + R02 * scaled.z,
+        R10 * scaled.x + R11 * scaled.y + R12 * scaled.z,
+        R20 * scaled.x + R21 * scaled.y + R22 * scaled.z
+    );
+
+    float factor = gate * noise_lr * xyz_lr;
+    means[idx*3+0] += factor * transformed.x;
+    means[idx*3+1] += factor * transformed.y;
+    means[idx*3+2] += factor * transformed.z;
+}
+
+// Classify dead Gaussians for MCMC relocation.
+// Dead = sigmoid(opacity) < dead_thresh.
+// Also computes alive opacity for multinomial sampling.
+kernel void mcmc_classify_dead_kernel(
+    constant float* opacities      [[buffer(0)]],
+    device int* dead_flag          [[buffer(1)]],
+    device float* alive_opacity    [[buffer(2)]],
+    constant int& N                [[buffer(3)]],
+    constant float& dead_thresh    [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+    float opac = 1.0f / (1.0f + exp(-opacities[idx]));
+    bool is_dead = opac < dead_thresh;
+    dead_flag[idx] = is_dead ? 1 : 0;
+    alive_opacity[idx] = is_dead ? 0.0f : opac;
+}
+
+// Relocate dead Gaussians by sampling from alive set (weighted by opacity).
+// Uses binary search on prefix-sum of alive opacities for multinomial sampling.
+// Applies rendering-invariant split: new opacity = 1 - (1-o_target)^(1/2).
+kernel void mcmc_relocate_kernel(
+    constant int* dead_flag            [[buffer(0)]],
+    constant float* alive_prefix_sum   [[buffer(1)]],
+    constant float& total_alive_weight [[buffer(2)]],
+    device float* means_buf            [[buffer(3)]],
+    device float* scales_buf           [[buffer(4)]],
+    device float* quats_buf            [[buffer(5)]],
+    device float* featuresDc_buf       [[buffer(6)]],
+    device float* featuresRest_buf     [[buffer(7)]],
+    device float* opacities_buf        [[buffer(8)]],
+    constant int& fr_stride            [[buffer(9)]],
+    device uint2* rng_states           [[buffer(10)]],
+    device float* adam_ea0             [[buffer(11)]],
+    device float* adam_ea1             [[buffer(12)]],
+    device float* adam_ea2             [[buffer(13)]],
+    device float* adam_ea3             [[buffer(14)]],
+    device float* adam_ea4             [[buffer(15)]],
+    device float* adam_ea5             [[buffer(16)]],
+    device float* adam_es0             [[buffer(17)]],
+    device float* adam_es1             [[buffer(18)]],
+    device float* adam_es2             [[buffer(19)]],
+    device float* adam_es3             [[buffer(20)]],
+    device float* adam_es4             [[buffer(21)]],
+    device float* adam_es5             [[buffer(22)]],
+    constant int& N                    [[buffer(23)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N || dead_flag[idx] == 0) return;
+
+    PCGState rng = {rng_states[idx]};
+    float u = pcg_float(rng) * total_alive_weight;
+
+    // Binary search for target in prefix sum
+    int lo = 0, hi = N - 1;
+    while (lo < hi) {
+        int mid = (lo + hi) / 2;
+        if (alive_prefix_sum[mid] < u) lo = mid + 1;
+        else hi = mid;
+    }
+    int target = lo;
+
+    // Copy target's parameters
+    for (int c = 0; c < 3; c++) means_buf[idx*3+c] = means_buf[target*3+c];
+    for (int c = 0; c < 3; c++) scales_buf[idx*3+c] = scales_buf[target*3+c];
+    for (int c = 0; c < 4; c++) quats_buf[idx*4+c] = quats_buf[target*4+c];
+    for (int c = 0; c < 3; c++) featuresDc_buf[idx*3+c] = featuresDc_buf[target*3+c];
+    for (int c = 0; c < fr_stride; c++) featuresRest_buf[idx*fr_stride+c] = featuresRest_buf[target*fr_stride+c];
+
+    // Rendering-invariant split: new opacity = 1 - sqrt(1 - o_target)
+    float target_opac = 1.0f / (1.0f + exp(-opacities_buf[target]));
+    float new_opac = 1.0f - sqrt(max(1.0f - target_opac, 1e-7f));
+    float new_logit = log(new_opac / (1.0f - new_opac));
+    opacities_buf[idx] = new_logit;
+    opacities_buf[target] = new_logit;
+
+    // Zero optimizer state for relocated Gaussian
+    for (int c = 0; c < 3; c++) { adam_ea0[idx*3+c] = 0; adam_es0[idx*3+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea1[idx*3+c] = 0; adam_es1[idx*3+c] = 0; }
+    for (int c = 0; c < 4; c++) { adam_ea2[idx*4+c] = 0; adam_es2[idx*4+c] = 0; }
+    for (int c = 0; c < 3; c++) { adam_ea3[idx*3+c] = 0; adam_es3[idx*3+c] = 0; }
+    for (int c = 0; c < fr_stride; c++) { adam_ea4[idx*fr_stride+c] = 0; adam_es4[idx*fr_stride+c] = 0; }
+    adam_ea5[idx] = 0; adam_es5[idx] = 0;
+
+    rng_states[idx] = rng.state;
+}
+
+// L1 regularization reduction kernel: sum |scales| and |opacities| for MCMC regularization loss.
+// Output: reg_out[0] = sum(|exp(scales)|), reg_out[1] = sum(|sigmoid(opacities)|)
+kernel void mcmc_reg_loss_kernel(
+    constant float* scales       [[buffer(0)]],
+    constant float* opacities    [[buffer(1)]],
+    constant int& N              [[buffer(2)]],
+    device atomic_float* reg_out [[buffer(3)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+    float s_sum = exp(scales[idx*3]) + exp(scales[idx*3+1]) + exp(scales[idx*3+2]);
+    float o = 1.0f / (1.0f + exp(-opacities[idx]));
+    atomic_fetch_add_explicit(&reg_out[0], s_sum, memory_order_relaxed);
+    atomic_fetch_add_explicit(&reg_out[1], o, memory_order_relaxed);
+}
