@@ -105,6 +105,8 @@ int main(int argc, char *argv[]) {
     app.add_option("--mcmc-scale-reg", mcmcScaleReg, "MCMC L1 scale regularization weight");
     float mcmcOpacityReg = 0.01f;
     app.add_option("--mcmc-opacity-reg", mcmcOpacityReg, "MCMC L1 opacity regularization weight");
+    int mcmcCapMax = 1000000;
+    app.add_option("--mcmc-cap-max", mcmcCapMax, "MCMC max Gaussian budget (default 1M)");
 
     bool use3dFilter = false;
     app.add_flag("--3d-filter", use3dFilter, "Enable Mip-Splatting 3D smoothing filter");
@@ -156,6 +158,7 @@ int main(int argc, char *argv[]) {
             model.mcmc_noise_lr = mcmcNoiseLr;
             model.mcmc_scale_reg = mcmcScaleReg;
             model.mcmc_opacity_reg = mcmcOpacityReg;
+            model.mcmc_cap_max = mcmcCapMax;
         }
 
         if (use3dFilter) {
