@@ -120,6 +120,7 @@ struct Model{
 
   bool use_3d_filter = false;
   MTensor filter_3d;
+  MTensor filter_3d_buf;
 
   bool use_bilateral_grid = false;
   int grid_X = 16, grid_Y = 16, grid_W = 8;

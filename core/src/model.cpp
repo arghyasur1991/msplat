@@ -127,7 +127,8 @@ Model::Model(const InputData &inputData, int numCameras,
     initBilateralGrids();
 
     if (use_3d_filter) {
-        filter_3d = gpu_zeros({(int64_t)num_active}, DType::Float32);
+        filter_3d_buf = gpu_zeros({(int64_t)buf_capacity}, DType::Float32);
+        filter_3d = filter_3d_buf.view(num_active);
     }
 }
 
@@ -207,6 +208,9 @@ void Model::refreshViews(){
         adam_exp_avg[g] = adam_exp_avg_buf[g].view(num_active);
         adam_exp_avg_sq[g] = adam_exp_avg_sq_buf[g].view(num_active);
     }
+    if (use_3d_filter && filter_3d_buf.defined()) {
+        filter_3d = filter_3d_buf.view(num_active);
+    }
 }
 
 void Model::ensureCapacity(int needed){
@@ -238,6 +242,12 @@ void Model::ensureCapacity(int needed){
     int64_t fr_stride = featuresRest_buf.stride0();
     densify_compact_scratch = gpu_zeros({(int64_t)new_cap * fr_stride}, DType::Float32);
     densify_random_samples = gpu_zeros({new_cap, 3}, DType::Float32);
+
+    if (use_3d_filter && filter_3d_buf.defined()) {
+        filter_3d_buf = gpu_empty({(int64_t)new_cap}, DType::Float32);
+        float* f = filter_3d_buf.data<float>();
+        for (int i = 0; i < new_cap; i++) f[i] = 1.0f;
+    }
 
     buf_capacity = new_cap;
     refreshViews();
@@ -378,7 +388,7 @@ void Model::afterTrainMCMC(int step) {
     float total_alive_weight = prefix[N - 1];
 
     if (total_alive_weight > 0.0f) {
-        int fr_stride = (int)featuresRest.size(-2);
+        int fr_stride = (int)(featuresRest.numel() / featuresRest.size(0));
         msplat_mcmc_relocate(N, dead_flag, alive_prefix_sum, total_alive_weight,
                              means, scales, quats, featuresDc, featuresRest,
                              opacities, fr_stride, rng_states,
@@ -631,18 +641,11 @@ Model::CamSetup Model::prepareCam(Camera& cam, int step) {
 }
 
 void Model::compute3DFilter(std::vector<Camera>& cameras) {
-    if (!use_3d_filter || !filter_3d.defined()) return;
+    if (!use_3d_filter || !filter_3d_buf.defined()) return;
 
-    // Zero the filter before computing max across all views
-    memset(filter_3d.data_ptr(), 0, filter_3d.nbytes());
-
-    int N = num_active;
-    for (auto& cam : cameras) {
-        auto s = prepareCam(cam, 0);
-        msplat_compute_3d_filter(N, means, cam.cachedViewMat, s.fx, s.fy,
-                                 filter_3d);
-    }
-    msplat_gpu_sync();
+    float* f = filter_3d_buf.data<float>();
+    for (int i = 0; i < buf_capacity; i++) f[i] = 1.0f;
+    filter_3d = filter_3d_buf.view(num_active);
 }
 
 MTensor Model::render(Camera& cam, int step){

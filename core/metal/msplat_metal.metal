@@ -1763,10 +1763,12 @@ kernel void project_and_sh_forward_kernel(
 
     float filter_val = filter_3d[idx];
     if (filter_val > 0.0f) {
-        float filter_sq = 1.0f / (filter_val * filter_val);
-        local_cov3d[0] += filter_sq;
-        local_cov3d[3] += filter_sq;
-        local_cov3d[5] += filter_sq;
+        float max_focal = max(intrins.x, intrins.y);
+        float v_k = max_focal / p_view.z;
+        float filter_inv_sq = 1.0f / (v_k * v_k);
+        local_cov3d[0] += filter_inv_sq;
+        local_cov3d[3] += filter_inv_sq;
+        local_cov3d[5] += filter_inv_sq;
     }
 
     float fx = intrins.x;
@@ -1911,10 +1913,13 @@ kernel void project_and_sh_backward_kernel(
 
     float filter_val = filter_3d[idx];
     if (filter_val > 0.0f) {
-        float filter_sq = 1.0f / (filter_val * filter_val);
-        local_cov3d[0] += filter_sq;
-        local_cov3d[3] += filter_sq;
-        local_cov3d[5] += filter_sq;
+        float3 p_view_bwd = transform_4x3(viewmat, p_world);
+        float max_focal = max(fx, fy);
+        float v_k = max_focal / p_view_bwd.z;
+        float filter_inv_sq = 1.0f / (v_k * v_k);
+        local_cov3d[0] += filter_inv_sq;
+        local_cov3d[3] += filter_inv_sq;
+        local_cov3d[5] += filter_inv_sq;
     }
 
     // v_cov3d (thread-local) and v_mean3d contribution
@@ -3829,7 +3834,11 @@ kernel void sgld_noise_kernel(
 
     float raw_opac = opacities[idx];
     float opacity = 1.0f / (1.0f + exp(-raw_opac));
-    float gate = 1.0f / (1.0f + exp(-100.0f * (0.995f - opacity)));
+
+    // Gate: inject noise into LOW opacity Gaussians (matches gsplat)
+    // op_sigmoid(1 - opacity, k=100, x0=0.995)
+    float x = 1.0f - opacity;
+    float gate = 1.0f / (1.0f + exp(-100.0f * (x - 0.995f)));
 
     if (gate < 0.001f) return;
 
@@ -3843,13 +3852,22 @@ kernel void sgld_noise_kernel(
     q /= qlen;
 
     // Rotation matrix from quaternion (row-major)
-    float r = q.x, x = q.y, y = q.z, z = q.w;
-    float R00 = 1-2*(y*y+z*z), R01 = 2*(x*y-r*z), R02 = 2*(x*z+r*y);
-    float R10 = 2*(x*y+r*z), R11 = 1-2*(x*x+z*z), R12 = 2*(y*z-r*x);
-    float R20 = 2*(x*z-r*y), R21 = 2*(y*z+r*x), R22 = 1-2*(x*x+y*y);
+    float r = q.x, xi = q.y, y = q.z, z = q.w;
+    float R00 = 1-2*(y*y+z*z), R01 = 2*(xi*y-r*z), R02 = 2*(xi*z+r*y);
+    float R10 = 2*(xi*y+r*z), R11 = 1-2*(xi*xi+z*z), R12 = 2*(y*z-r*xi);
+    float R20 = 2*(xi*z-r*y), R21 = 2*(y*z+r*xi), R22 = 1-2*(xi*xi+y*y);
 
-    // Transform noise by covariance: R @ diag(scale) @ noise
-    float3 scaled = noise * scale;
+    // Transform noise by full covariance: covar @ noise = R @ diag(s^2) @ R^T @ noise
+    float3 s2 = scale * scale;
+    // First: R^T @ noise
+    float3 rt_noise = float3(
+        R00 * noise.x + R10 * noise.y + R20 * noise.z,
+        R01 * noise.x + R11 * noise.y + R21 * noise.z,
+        R02 * noise.x + R12 * noise.y + R22 * noise.z
+    );
+    // Then: diag(s^2) @ (R^T @ noise)
+    float3 scaled = rt_noise * s2;
+    // Then: R @ result
     float3 transformed = float3(
         R00 * scaled.x + R01 * scaled.y + R02 * scaled.z,
         R10 * scaled.x + R11 * scaled.y + R12 * scaled.z,

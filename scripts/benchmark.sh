@@ -5,7 +5,7 @@
 # Examples:
 #   ./scripts/benchmark.sh                              # baseline 7K
 #   ./scripts/benchmark.sh ~/datasets/mipnerf360 7000   # baseline 7K
-#   ./scripts/benchmark.sh ~/datasets/mipnerf360 7000 --random-bg --3d-filter  # with features
+#   ./scripts/benchmark.sh ~/datasets/mipnerf360 7000 --random-bg --3d-filter
 
 set -euo pipefail
 
@@ -43,9 +43,9 @@ for scene in "${SCENES[@]}"; do
     START_TIME=$(date +%s)
 
     "$MSPLAT" \
-        --input "$SCENE_DIR" \
-        --output "$OUTPUT" \
-        --num-iters "$ITERS" \
+        "$SCENE_DIR" \
+        -o "$OUTPUT" \
+        -n "$ITERS" \
         --num-downscales 0 \
         --eval \
         $EXTRA_ARGS \
@@ -72,14 +72,18 @@ for scene in "${SCENES[@]}"; do
         continue
     fi
 
-    PSNR=$(grep -oP 'PSNR:\s+\K[\d.]+' "$LOG" | tail -1 || echo "N/A")
-    SSIM=$(grep -oP 'SSIM:\s+\K[\d.]+' "$LOG" | tail -1 || echo "N/A")
-    GAUSSIANS=$(grep -oP 'Gaussians:\s+\K[\d,]+' "$LOG" | tail -1 || echo "N/A")
+    SUMMARY=$(grep "PSNR:.*SSIM:.*Gaussians:" "$LOG" | tail -1)
+    if [ -n "$SUMMARY" ]; then
+        PSNR=$(echo "$SUMMARY" | sed 's/.*PSNR:[[:space:]]*//' | awk '{print $1}')
+        SSIM=$(echo "$SUMMARY" | sed 's/.*SSIM:[[:space:]]*//' | awk '{print $1}')
+        GAUSSIANS=$(echo "$SUMMARY" | sed 's/.*Gaussians:[[:space:]]*//' | awk '{print $1}')
+    else
+        PSNR="N/A"; SSIM="N/A"; GAUSSIANS="N/A"
+    fi
 
-    START_LINE=$(grep -n "Starting training" "$RESULTS_DIR/$scene/log.txt" 2>/dev/null | head -1 | cut -d: -f1)
     TIME="N/A"
-    if [ -f "$RESULTS_DIR/$scene/log.txt" ]; then
-        TIME=$(grep "Done in" "$RESULTS_DIR/$scene/log.txt" | grep -oP '\d+(?=s)' || echo "N/A")
+    if grep -q "Done in" "$LOG"; then
+        TIME=$(grep "Done in" "$LOG" | sed 's/.*Done in \([0-9]*\)s.*/\1/')
     fi
 
     printf "%-12s %8s %8s %12s %10s\n" "$scene" "$PSNR" "$SSIM" "$GAUSSIANS" "$TIME"
