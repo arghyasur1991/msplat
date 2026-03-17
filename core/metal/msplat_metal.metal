@@ -196,7 +196,8 @@ float3 project_cov3d_ewa(
     const float fy,
     const float tan_fovx,
     const float tan_fovy,
-    float3 p_view
+    float3 p_view,
+    thread float& compensation
 ) {
     // Clamp view-space position to avoid extreme covariance at FOV edges
     float lim_x = 1.3f * tan_fovx;
@@ -234,7 +235,15 @@ float3 project_cov3d_ewa(
                          t1.x*v01 + t1.y*v11 + t1.z*v12,
                          t1.x*v02 + t1.y*v12 + t1.z*v22);
 
-    return float3(dot(tv0, t0) + 0.3f, dot(tv0, t1), dot(tv1, t1) + 0.3f);
+    float c00 = dot(tv0, t0);
+    float c01 = dot(tv0, t1);
+    float c11 = dot(tv1, t1);
+    float det_before = c00 * c11 - c01 * c01;
+    c00 += 0.083333f;
+    c11 += 0.083333f;
+    float det_after = c00 * c11 - c01 * c01;
+    compensation = sqrt(max(det_before / det_after, 0.0f));
+    return float3(c00, c01, c11);
 }
 
 // Thread-local overload: reads cov3d from registers
@@ -245,7 +254,8 @@ float3 project_cov3d_ewa(
     const float fy,
     const float tan_fovx,
     const float tan_fovy,
-    float3 p_view
+    float3 p_view,
+    thread float& compensation
 ) {
     float lim_x = 1.3f * tan_fovx;
     float lim_y = 1.3f * tan_fovy;
@@ -277,7 +287,15 @@ float3 project_cov3d_ewa(
                          t1.x*v01 + t1.y*v11 + t1.z*v12,
                          t1.x*v02 + t1.y*v12 + t1.z*v22);
 
-    return float3(dot(tv0, t0) + 0.3f, dot(tv0, t1), dot(tv1, t1) + 0.3f);
+    float c00 = dot(tv0, t0);
+    float c01 = dot(tv0, t1);
+    float c11 = dot(tv1, t1);
+    float det_before = c00 * c11 - c01 * c01;
+    c00 += 0.083333f;
+    c11 += 0.083333f;
+    float det_after = c00 * c11 - c01 * c01;
+    compensation = sqrt(max(det_before / det_after, 0.0f));
+    return float3(c00, c01, c11);
 }
 
 inline bool compute_cov2d_bounds(
@@ -408,6 +426,7 @@ kernel void project_gaussians_forward_kernel(
     device float* conics, // float3
     device int32_t* num_tiles_hit,
     device float* aabb, // float2: per-axis pixel extents
+    device float* opac_compensations,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -437,8 +456,9 @@ kernel void project_gaussians_forward_kernel(
     float cy = intrins.w;
     float tan_fovx = 0.5f * img_size.x / fx;
     float tan_fovy = 0.5f * img_size.y / fy;
+    float compensation = 1.0f;
     float3 cov2d = project_cov3d_ewa(
-        cur_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view
+        cur_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view, compensation
     );
 
     float3 conic;
@@ -467,6 +487,7 @@ kernel void project_gaussians_forward_kernel(
     write_packed_float2(xys, idx, center);
     aabb[idx * 2] = aabb_x;
     aabb[idx * 2 + 1] = aabb_y;
+    opac_compensations[idx] = compensation;
 }
 
 kernel void nd_rasterize_forward_kernel(
@@ -1718,6 +1739,7 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_rest,
     device float* colors,
     device float* aabb, // float2: per-axis pixel extents
+    device float* opac_compensations,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -1745,8 +1767,9 @@ kernel void project_and_sh_forward_kernel(
     float cy = intrins.w;
     float tan_fovx = 0.5f * img_size.x / fx;
     float tan_fovy = 0.5f * img_size.y / fy;
+    float compensation = 1.0f;
     float3 cov2d = project_cov3d_ewa(
-        local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view
+        local_cov3d, viewmat, fx, fy, tan_fovx, tan_fovy, p_view, compensation
     );
 
     float3 conic;
@@ -1775,6 +1798,7 @@ kernel void project_and_sh_forward_kernel(
     write_packed_float2(xys, idx, center);
     aabb[idx * 2] = aabb_x;
     aabb[idx * 2 + 1] = aabb_y;
+    opac_compensations[idx] = compensation;
 
     // SH: compute colors for non-culled gaussians (reuse p_world from registers)
     float3 viewdir = normalize(p_world - cam_pos);
@@ -1999,6 +2023,7 @@ kernel void pack_sorted_gaussians_kernel(
     constant uint& N                 [[buffer(8)]],
     constant int32_t* cum_tiles_hit  [[buffer(9)]],
     constant uint& num_points        [[buffer(10)]],
+    constant float* opac_compensations [[buffer(11)]],
     uint idx [[thread_position_in_grid]]
 ) {
     uint actual_N = min(N, (uint)cum_tiles_hit[num_points - 1]);
@@ -2006,6 +2031,7 @@ kernel void pack_sorted_gaussians_kernel(
     int32_t g_id = gaussian_ids_sorted[idx];
     float2 xy = read_packed_float2(xys, g_id);
     float opac = 1.f / (1.f + exp(-opacities[g_id]));
+    opac *= opac_compensations[g_id];
     float3 conic = read_packed_float3(conics, g_id);
     float3 rgb = read_packed_float3(colors, g_id);
     write_packed_float3(packed_xy_opac, idx, {xy.x, xy.y, opac});
@@ -2076,6 +2102,7 @@ kernel void bitonic_sort_per_tile_kernel(
     device float* packed_conic          [[buffer(10)]],
     device float* packed_rgb            [[buffer(11)]],
     device int* tile_bins               [[buffer(12)]],
+    constant float* opac_compensations  [[buffer(13)]],
     uint tg_id [[threadgroup_position_in_grid]],
     uint tid [[thread_position_in_threadgroup]]
 ) {
@@ -2131,6 +2158,7 @@ kernel void bitonic_sort_per_tile_kernel(
         gaussian_ids_out[global_idx] = g_id;
         float2 xy = read_packed_float2(xys, g_id);
         float opac = 1.f / (1.f + exp(-opacities[g_id]));
+        opac *= opac_compensations[g_id];
         write_packed_float3(packed_xy_opac, global_idx, {xy.x, xy.y, opac});
         write_packed_float3(packed_conic, global_idx, read_packed_float3(conics, g_id));
         write_packed_float3(packed_rgb, global_idx, read_packed_float3(colors, g_id));

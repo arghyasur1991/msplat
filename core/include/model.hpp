@@ -1,6 +1,7 @@
 #ifndef MODEL_H
 #define MODEL_H
 
+#include <random>
 #include "metal_tensor.hpp"
 #include "ssim.hpp"
 #include "input_data.hpp"
@@ -14,6 +15,7 @@ struct Model{
         int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
         int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
         int maxSteps, bool keepCrs,
+        bool randomBackground = true, int stopSplitAtOverride = -1,
         const float* bgColor = nullptr);
 
   ~Model(){ releaseOptimizers(); }
@@ -94,6 +96,9 @@ struct Model{
   float splitScreenSize;
   int maxSteps;
   bool keepCrs;
+  bool randomBackground = true;
+
+  std::mt19937 bgRng{42};
 
   float scale;
   float translation[3] = {};

@@ -351,6 +351,7 @@ struct FusedTensorCache {
 
     // Forward intermediates
     MTensor xys, depths, radii_out, conics, num_tiles_hit, colors, aabb;
+    MTensor opac_compensations;
     MTensor gaussian_ids;
     MTensor packed_xy_opac, packed_conic, packed_rgb;
     MTensor out_img, final_Ts, final_idx;
@@ -391,6 +392,7 @@ struct FusedTensorCache {
             num_tiles_hit = mtensor_empty(dev, {np}, DType::Int32);
             colors = mtensor_empty(dev, {np, 3}, DType::Float32);
             aabb = mtensor_empty(dev, {np, 2}, DType::Float32);
+            opac_compensations = mtensor_empty(dev, {np}, DType::Float32);
             block_totals = mtensor_empty(dev, {(np + 1023) / 1024}, DType::Int32);
         }
         if (cap != capacity) {
@@ -568,7 +570,7 @@ static void forward_pipeline(
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
-        // buffer 23 removed (was opacity-aware AABB, reverted)
+        ENC_BUF(enc, opac_compensations, 23);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -607,6 +609,7 @@ static void forward_pipeline(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            ENC_BUF(enc, opac_compensations, 13);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };
@@ -911,7 +914,7 @@ std::tuple<MTensor, float> msplat_train_step(
         [enc setBytes:cam_pos_arr->data() length:sizeof(*cam_pos_arr) atIndex:18];
         ENC_BUF(enc, features_dc, 19); ENC_BUF(enc, features_rest, 20);
         ENC_BUF(enc, colors, 21); ENC_BUF(enc, aabb, 22);
-        // buffer 23 removed (was opacity-aware AABB, reverted)
+        ENC_BUF(enc, opac_compensations, 23);
 
         [enc dispatchThreads:MTLSizeMake(num_points, 1, 1) threadsPerThreadgroup:MTLSizeMake(tpg, 1, 1)];
     };
@@ -950,6 +953,7 @@ std::tuple<MTensor, float> msplat_train_step(
             ENC_BUF(enc, colors, 7); ENC_BUF(enc, opacities, 8);
             ENC_BUF(enc, packed_xy_opac, 9); ENC_BUF(enc, packed_conic, 10); ENC_BUF(enc, packed_rgb, 11);
             ENC_BUF(enc, tile_bins, 12);
+            ENC_BUF(enc, opac_compensations, 13);
             [enc dispatchThreadgroups:MTLSizeMake(num_tiles, 1, 1) threadsPerThreadgroup:MTLSizeMake(256, 1, 1)];
         }
     };

@@ -86,6 +86,10 @@ int main(int argc, char *argv[]) {
     app.add_option("--split-screen-size", splitScreenSize, "Screen-space split threshold");
     bool keepCrs = false;
     app.add_flag("--keep-crs", keepCrs, "Retain input coordinate reference system");
+    bool randomBg = true;
+    app.add_flag("--random-bg,!--no-random-bg", randomBg, "Randomize background color each iteration");
+    int stopSplitAt = -1;
+    app.add_option("--stop-split-at", stopSplitAt, "Stop splitting after step (-1 = maxSteps/2)");
     std::vector<float> bgColor = {0.6130f, 0.0101f, 0.3984f};
     app.add_option("--bg-color", bgColor, "Background RGB (0-1), default magenta")
         ->expected(3);
@@ -122,6 +126,7 @@ int main(int argc, char *argv[]) {
                      refineEvery, warmupLength, resetAlphaEvery, densifyGradThresh,
                      densifySizeThresh, stopScreenSizeAt, splitScreenSize,
                      numIters, keepCrs,
+                     randomBg, stopSplitAt,
                      bgColor.data());
 
         std::vector<size_t> camIndices(cams.size());

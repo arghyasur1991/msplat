@@ -44,13 +44,16 @@ Model::Model(const InputData &inputData, int numCameras,
     int numDownscales, int resolutionSchedule, int shDegree, int shDegreeInterval,
     int refineEvery, int warmupLength, int resetAlphaEvery, float densifyGradThresh, float densifySizeThresh, int stopScreenSizeAt, float splitScreenSize,
     int maxSteps, bool keepCrs,
+    bool randomBackground, int stopSplitAtOverride,
     const float* bgColor)
     : numCameras(numCameras), numDownscales(numDownscales), resolutionSchedule(resolutionSchedule),
       shDegree(shDegree), shDegreeInterval(shDegreeInterval),
       refineEvery(refineEvery), warmupLength(warmupLength), resetAlphaEvery(resetAlphaEvery),
       stopSplitAt(maxSteps / 2), densifyGradThresh(densifyGradThresh), densifySizeThresh(densifySizeThresh),
       stopScreenSizeAt(stopScreenSizeAt), splitScreenSize(splitScreenSize),
-      maxSteps(maxSteps), keepCrs(keepCrs) {
+      maxSteps(maxSteps), keepCrs(keepCrs), randomBackground(randomBackground) {
+
+    if (stopSplitAtOverride >= 0) stopSplitAt = stopSplitAtOverride;
 
     int64_t numPoints = inputData.points.count;
     scale = inputData.scale;
@@ -575,6 +578,12 @@ void Model::fullIteration(Camera& cam, int step, MTensor &gt, float ssimWeight){
         xysGradNorm = gpu_zeros({numPoints}, DType::Float32);
         visCounts = gpu_zeros({numPoints}, DType::Float32);
         max2DSize = gpu_zeros({numPoints}, DType::Float32);
+    }
+
+    if (randomBackground) {
+        std::uniform_real_distribution<float> dist(0.0f, 1.0f);
+        float bg[3] = {dist(bgRng), dist(bgRng), dist(bgRng)};
+        memcpy(backgroundColor.data_ptr(), bg, 3 * sizeof(float));
     }
 
     float invMaxDim = 1.0f / static_cast<float>((std::max)(lastHeight, lastWidth));
