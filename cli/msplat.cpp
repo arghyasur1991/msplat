@@ -211,6 +211,13 @@ int main(int argc, char *argv[]) {
                 bench_drain_ms.push_back(drain_ms);
             }
 
+            if (step % 100 == 0 || step == 1) {
+                auto now = cpu_now();
+                double iter_ms_report = std::chrono::duration_cast<std::chrono::microseconds>(now - iter_start).count() / 1000.0;
+                fprintf(stderr, "step= %5zu  splats= %d  ms=%.1f\n", step, model.num_active, iter_ms_report);
+                fflush(stderr);
+            }
+
             if (saveEvery > 0 && step % saveEvery == 0) {
                 fs::path p(outputScene);
                 model.save(p.replace_filename(fs::path(p.stem().string() + "_" + std::to_string(step) + p.extension().string())).string(), step);
