@@ -106,6 +106,13 @@ int main(int argc, char *argv[]) {
     float mcmcOpacityReg = 0.01f;
     app.add_option("--mcmc-opacity-reg", mcmcOpacityReg, "MCMC L1 opacity regularization weight");
 
+    bool useBilateralGrid = false;
+    app.add_flag("--bilateral-grid", useBilateralGrid, "Enable per-view bilateral grid appearance modeling");
+    float bilateralLr = 1e-3f;
+    app.add_option("--bilateral-lr", bilateralLr, "Bilateral grid learning rate");
+    float bilateralTvWeight = 10.0f;
+    app.add_option("--bilateral-tv-weight", bilateralTvWeight, "Bilateral grid TV regularization weight");
+
     CLI11_PARSE(app, argc, argv);
 
     if (validate || !valRender.empty()) validate = true;
@@ -146,6 +153,13 @@ int main(int argc, char *argv[]) {
             model.mcmc_noise_lr = mcmcNoiseLr;
             model.mcmc_scale_reg = mcmcScaleReg;
             model.mcmc_opacity_reg = mcmcOpacityReg;
+        }
+
+        if (useBilateralGrid) {
+            model.use_bilateral_grid = true;
+            model.bilateral_lr = bilateralLr;
+            model.bilateral_tv_weight = bilateralTvWeight;
+            model.initBilateralGrids();
         }
 
         std::vector<size_t> camIndices(cams.size());

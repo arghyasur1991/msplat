@@ -3948,3 +3948,191 @@ kernel void mcmc_reg_loss_kernel(
     atomic_fetch_add_explicit(&reg_out[0], s_sum, memory_order_relaxed);
     atomic_fetch_add_explicit(&reg_out[1], o, memory_order_relaxed);
 }
+
+// ===== Bilateral Grid Appearance Modeling =====
+// Per-view learned affine color correction. Grid dimensions: (grid_X, grid_Y, grid_W)
+// with 12 floats per cell (3x4 affine: A[3x3] + b[3]).
+// Grid layout: [N_views, 12, grid_W, grid_Y, grid_X] stored as flat float array.
+
+kernel void bilateral_slice_forward_kernel(
+    constant float* rendered_img    [[buffer(0)]],
+    constant float* grid            [[buffer(1)]],
+    device float* corrected_img     [[buffer(2)]],
+    constant uint2& img_size        [[buffer(3)]],
+    constant uint3& grid_dims       [[buffer(4)]],
+    uint2 gp [[thread_position_in_grid]]
+) {
+    uint px = gp.x, py = gp.y;
+    uint W = img_size.x, H = img_size.y;
+    if (px >= W || py >= H) return;
+
+    uint gX = grid_dims.x, gY = grid_dims.y, gW = grid_dims.z;
+    uint pix_idx = (py * W + px) * 3;
+    float3 rgb_in = float3(rendered_img[pix_idx], rendered_img[pix_idx+1], rendered_img[pix_idx+2]);
+
+    float gx = (float(px) + 0.5f) / float(W) * float(gX);
+    float gy = (float(py) + 0.5f) / float(H) * float(gY);
+    float intensity = 0.299f * rgb_in.x + 0.587f * rgb_in.y + 0.114f * rgb_in.z;
+    float gz = clamp(intensity * 2.0f - 1.0f, 0.0f, 1.0f) * float(gW - 1);
+
+    int ix0 = clamp(int(gx - 0.5f), 0, int(gX)-1), ix1 = min(ix0+1, int(gX)-1);
+    int iy0 = clamp(int(gy - 0.5f), 0, int(gY)-1), iy1 = min(iy0+1, int(gY)-1);
+    int iz0 = clamp(int(gz), 0, int(gW)-1), iz1 = min(iz0+1, int(gW)-1);
+    float fx = gx - 0.5f - float(ix0); fx = clamp(fx, 0.0f, 1.0f);
+    float fy = gy - 0.5f - float(iy0); fy = clamp(fy, 0.0f, 1.0f);
+    float fz = gz - float(iz0); fz = clamp(fz, 0.0f, 1.0f);
+
+    float affine[12] = {};
+    for (int c = 0; c < 12; c++) {
+        uint base = c * gW * gY * gX;
+        float v000 = grid[base + iz0*gY*gX + iy0*gX + ix0];
+        float v001 = grid[base + iz0*gY*gX + iy0*gX + ix1];
+        float v010 = grid[base + iz0*gY*gX + iy1*gX + ix0];
+        float v011 = grid[base + iz0*gY*gX + iy1*gX + ix1];
+        float v100 = grid[base + iz1*gY*gX + iy0*gX + ix0];
+        float v101 = grid[base + iz1*gY*gX + iy0*gX + ix1];
+        float v110 = grid[base + iz1*gY*gX + iy1*gX + ix0];
+        float v111 = grid[base + iz1*gY*gX + iy1*gX + ix1];
+
+        float v00 = mix(v000, v001, fx);
+        float v01 = mix(v010, v011, fx);
+        float v10 = mix(v100, v101, fx);
+        float v11 = mix(v110, v111, fx);
+        float v0 = mix(v00, v01, fy);
+        float v1 = mix(v10, v11, fy);
+        affine[c] = mix(v0, v1, fz);
+    }
+
+    float3 rgb_out;
+    rgb_out.x = affine[0]*rgb_in.x + affine[1]*rgb_in.y + affine[2]*rgb_in.z + affine[3];
+    rgb_out.y = affine[4]*rgb_in.x + affine[5]*rgb_in.y + affine[6]*rgb_in.z + affine[7];
+    rgb_out.z = affine[8]*rgb_in.x + affine[9]*rgb_in.y + affine[10]*rgb_in.z + affine[11];
+
+    corrected_img[pix_idx] = rgb_out.x;
+    corrected_img[pix_idx+1] = rgb_out.y;
+    corrected_img[pix_idx+2] = rgb_out.z;
+}
+
+kernel void bilateral_slice_backward_kernel(
+    constant float* rendered_img       [[buffer(0)]],
+    constant float* grid               [[buffer(1)]],
+    constant float* dL_d_corrected     [[buffer(2)]],
+    device float* dL_d_rendered        [[buffer(3)]],
+    device atomic_float* dL_d_grid     [[buffer(4)]],
+    constant uint2& img_size           [[buffer(5)]],
+    constant uint3& grid_dims          [[buffer(6)]],
+    uint2 gp [[thread_position_in_grid]]
+) {
+    uint px = gp.x, py = gp.y;
+    uint W = img_size.x, H = img_size.y;
+    if (px >= W || py >= H) return;
+
+    uint gX = grid_dims.x, gY = grid_dims.y, gW = grid_dims.z;
+    uint pix_idx = (py * W + px) * 3;
+    float3 rgb_in = float3(rendered_img[pix_idx], rendered_img[pix_idx+1], rendered_img[pix_idx+2]);
+    float3 dL_out = float3(dL_d_corrected[pix_idx], dL_d_corrected[pix_idx+1], dL_d_corrected[pix_idx+2]);
+
+    float gx = (float(px) + 0.5f) / float(W) * float(gX);
+    float gy = (float(py) + 0.5f) / float(H) * float(gY);
+    float intensity = 0.299f * rgb_in.x + 0.587f * rgb_in.y + 0.114f * rgb_in.z;
+    float gz = clamp(intensity * 2.0f - 1.0f, 0.0f, 1.0f) * float(gW - 1);
+
+    int ix0 = clamp(int(gx - 0.5f), 0, int(gX)-1), ix1 = min(ix0+1, int(gX)-1);
+    int iy0 = clamp(int(gy - 0.5f), 0, int(gY)-1), iy1 = min(iy0+1, int(gY)-1);
+    int iz0 = clamp(int(gz), 0, int(gW)-1), iz1 = min(iz0+1, int(gW)-1);
+    float fx = clamp(gx - 0.5f - float(ix0), 0.0f, 1.0f);
+    float fy = clamp(gy - 0.5f - float(iy0), 0.0f, 1.0f);
+    float fz = clamp(gz - float(iz0), 0.0f, 1.0f);
+
+    float affine[12] = {};
+    for (int c = 0; c < 12; c++) {
+        uint base = c * gW * gY * gX;
+        float v000 = grid[base + iz0*gY*gX + iy0*gX + ix0];
+        float v001 = grid[base + iz0*gY*gX + iy0*gX + ix1];
+        float v010 = grid[base + iz0*gY*gX + iy1*gX + ix0];
+        float v011 = grid[base + iz0*gY*gX + iy1*gX + ix1];
+        float v100 = grid[base + iz1*gY*gX + iy0*gX + ix0];
+        float v101 = grid[base + iz1*gY*gX + iy0*gX + ix1];
+        float v110 = grid[base + iz1*gY*gX + iy1*gX + ix0];
+        float v111 = grid[base + iz1*gY*gX + iy1*gX + ix1];
+        float v00 = mix(v000, v001, fx); float v01 = mix(v010, v011, fx);
+        float v10 = mix(v100, v101, fx); float v11 = mix(v110, v111, fx);
+        affine[c] = mix(mix(v00, v01, fy), mix(v10, v11, fy), fz);
+    }
+
+    float3 dL_in;
+    dL_in.x = affine[0]*dL_out.x + affine[4]*dL_out.y + affine[8]*dL_out.z;
+    dL_in.y = affine[1]*dL_out.x + affine[5]*dL_out.y + affine[9]*dL_out.z;
+    dL_in.z = affine[2]*dL_out.x + affine[6]*dL_out.y + affine[10]*dL_out.z;
+    dL_d_rendered[pix_idx] = dL_in.x;
+    dL_d_rendered[pix_idx+1] = dL_in.y;
+    dL_d_rendered[pix_idx+2] = dL_in.z;
+
+    float4 rgb1 = float4(rgb_in, 1.0f);
+    float dL_affine[12];
+    for (int r = 0; r < 3; r++)
+        for (int c = 0; c < 4; c++)
+            dL_affine[r*4+c] = ((float*)&dL_out)[r] * rgb1[c];
+
+    float weights[8] = {
+        (1-fx)*(1-fy)*(1-fz), fx*(1-fy)*(1-fz),
+        (1-fx)*fy*(1-fz),     fx*fy*(1-fz),
+        (1-fx)*(1-fy)*fz,     fx*(1-fy)*fz,
+        (1-fx)*fy*fz,         fx*fy*fz
+    };
+    int ix[2] = {ix0, ix1}, iy[2] = {iy0, iy1}, iz[2] = {iz0, iz1};
+    for (int c = 0; c < 12; c++) {
+        uint base = c * gW * gY * gX;
+        int w = 0;
+        for (int kz = 0; kz < 2; kz++)
+            for (int ky = 0; ky < 2; ky++)
+                for (int kx = 0; kx < 2; kx++) {
+                    uint addr = base + iz[kz]*gY*gX + iy[ky]*gX + ix[kx];
+                    atomic_fetch_add_explicit(&dL_d_grid[addr], dL_affine[c] * weights[w], memory_order_relaxed);
+                    w++;
+                }
+    }
+}
+
+kernel void bilateral_tv_loss_kernel(
+    constant float* grid         [[buffer(0)]],
+    device atomic_float* tv_loss [[buffer(1)]],
+    device atomic_float* dL_d_grid [[buffer(2)]],
+    constant uint3& grid_dims    [[buffer(3)]],
+    constant float& tv_weight    [[buffer(4)]],
+    uint3 gp [[thread_position_in_grid]]
+) {
+    uint gX = grid_dims.x, gY = grid_dims.y, gW = grid_dims.z;
+    uint x = gp.x, y = gp.y, z = gp.z;
+    if (x >= gX || y >= gY || z >= gW) return;
+
+    float loss_sum = 0.0f;
+    for (int c = 0; c < 12; c++) {
+        uint base = c * gW * gY * gX;
+        uint idx = base + z*gY*gX + y*gX + x;
+        float val = grid[idx];
+
+        if (x + 1 < gX) {
+            float dx = val - grid[idx + 1];
+            loss_sum += dx * dx;
+            float grad = 2.0f * dx * tv_weight;
+            atomic_fetch_add_explicit(&dL_d_grid[idx], grad, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dL_d_grid[idx + 1], -grad, memory_order_relaxed);
+        }
+        if (y + 1 < gY) {
+            float dy = val - grid[idx + gX];
+            loss_sum += dy * dy;
+            float grad = 2.0f * dy * tv_weight;
+            atomic_fetch_add_explicit(&dL_d_grid[idx], grad, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dL_d_grid[idx + gX], -grad, memory_order_relaxed);
+        }
+        if (z + 1 < gW) {
+            float dz = val - grid[idx + gY*gX];
+            loss_sum += dz * dz;
+            float grad = 2.0f * dz * tv_weight;
+            atomic_fetch_add_explicit(&dL_d_grid[idx], grad, memory_order_relaxed);
+            atomic_fetch_add_explicit(&dL_d_grid[idx + gY*gX], -grad, memory_order_relaxed);
+        }
+    }
+    atomic_fetch_add_explicit(tv_loss, loss_sum * tv_weight, memory_order_relaxed);
+}

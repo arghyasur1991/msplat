@@ -123,6 +123,8 @@ Model::Model(const InputData &inputData, int numCameras,
     if (strategy == TrainingStrategy::MCMC) {
         initMCMCBuffers();
     }
+
+    initBilateralGrids();
 }
 
 void Model::setupOptimizers(){
@@ -307,6 +309,28 @@ void Model::afterTrain(int step){
         visCounts.reset();
         max2DSize.reset();
     }
+}
+
+void Model::initBilateralGrids() {
+    if (!use_bilateral_grid) return;
+    int grid_size = 12 * grid_W * grid_Y * grid_X;
+    bilateral_grids.resize(numCameras);
+    bilateral_adam_m.resize(numCameras);
+    bilateral_adam_v.resize(numCameras);
+    for (int i = 0; i < numCameras; i++) {
+        bilateral_grids[i] = gpu_zeros({(int64_t)grid_size}, DType::Float32);
+        float *p = bilateral_grids[i].data<float>();
+        for (int w = 0; w < grid_W; w++)
+            for (int y = 0; y < grid_Y; y++)
+                for (int x = 0; x < grid_X; x++) {
+                    p[0 * grid_W * grid_Y * grid_X + w * grid_Y * grid_X + y * grid_X + x] = 1.0f;
+                    p[5 * grid_W * grid_Y * grid_X + w * grid_Y * grid_X + y * grid_X + x] = 1.0f;
+                    p[10 * grid_W * grid_Y * grid_X + w * grid_Y * grid_X + y * grid_X + x] = 1.0f;
+                }
+        bilateral_adam_m[i] = gpu_zeros({(int64_t)grid_size}, DType::Float32);
+        bilateral_adam_v[i] = gpu_zeros({(int64_t)grid_size}, DType::Float32);
+    }
+    bilateral_adam_step = 0;
 }
 
 void Model::initMCMCBuffers() {

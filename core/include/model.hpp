@@ -117,6 +117,17 @@ struct Model{
   MTensor alive_prefix_sum; // [N] float — prefix sum of alive opacities
   MTensor reg_out;          // [2] float — scale_reg_sum, opacity_reg_sum
 
+  bool use_bilateral_grid = false;
+  int grid_X = 16, grid_Y = 16, grid_W = 8;
+  float bilateral_tv_weight = 10.0f;
+  float bilateral_lr = 1e-3f;
+  std::vector<MTensor> bilateral_grids;
+  std::vector<MTensor> bilateral_adam_m;
+  std::vector<MTensor> bilateral_adam_v;
+  int bilateral_adam_step = 0;
+
+  void initBilateralGrids();
+
   std::mt19937 bgRng{42};
 
   float scale;
