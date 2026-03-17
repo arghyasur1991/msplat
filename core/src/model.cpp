@@ -125,6 +125,10 @@ Model::Model(const InputData &inputData, int numCameras,
     }
 
     initBilateralGrids();
+
+    if (use_3d_filter) {
+        filter_3d = gpu_zeros({(int64_t)num_active}, DType::Float32);
+    }
 }
 
 void Model::setupOptimizers(){

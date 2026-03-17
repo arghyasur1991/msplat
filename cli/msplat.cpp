@@ -106,6 +106,9 @@ int main(int argc, char *argv[]) {
     float mcmcOpacityReg = 0.01f;
     app.add_option("--mcmc-opacity-reg", mcmcOpacityReg, "MCMC L1 opacity regularization weight");
 
+    bool use3dFilter = false;
+    app.add_flag("--3d-filter", use3dFilter, "Enable Mip-Splatting 3D smoothing filter");
+
     bool useBilateralGrid = false;
     app.add_flag("--bilateral-grid", useBilateralGrid, "Enable per-view bilateral grid appearance modeling");
     float bilateralLr = 1e-3f;
@@ -153,6 +156,11 @@ int main(int argc, char *argv[]) {
             model.mcmc_noise_lr = mcmcNoiseLr;
             model.mcmc_scale_reg = mcmcScaleReg;
             model.mcmc_opacity_reg = mcmcOpacityReg;
+        }
+
+        if (use3dFilter) {
+            model.use_3d_filter = true;
+            model.filter_3d = gpu_zeros({(int64_t)model.num_active}, DType::Float32);
         }
 
         if (useBilateralGrid) {

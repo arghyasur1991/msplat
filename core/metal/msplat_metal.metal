@@ -1738,8 +1738,9 @@ kernel void project_and_sh_forward_kernel(
     constant float* features_dc,
     constant float* features_rest,
     device float* colors,
-    device float* aabb, // float2: per-axis pixel extents
+    device float* aabb,
     device float* opac_compensations,
+    constant float* filter_3d,
     uint3 gp [[thread_position_in_grid]]
 ) {
     uint idx = gp.x;
@@ -1757,9 +1758,16 @@ kernel void project_and_sh_forward_kernel(
 
     float3 scale = exp(read_packed_float3(scales, idx));
     float4 quat = read_packed_float4(quats, idx);
-    // Compute cov3d in thread-local registers (no device memory round-trip)
     float local_cov3d[6];
     scale_rot_to_cov3d(scale, glob_scale, quat, local_cov3d);
+
+    float filter_val = filter_3d[idx];
+    if (filter_val > 0.0f) {
+        float filter_sq = 1.0f / (filter_val * filter_val);
+        local_cov3d[0] += filter_sq;
+        local_cov3d[3] += filter_sq;
+        local_cov3d[5] += filter_sq;
+    }
 
     float fx = intrins.x;
     float fy = intrins.y;
@@ -1865,6 +1873,7 @@ kernel void project_and_sh_backward_kernel(
     device float* rest_exp_avg,
     device float* rest_exp_avg_sq,
     constant SHAdamParams& adam_hp,
+    constant float* filter_3d,
     uint idx [[thread_position_in_grid]]
 ) {
     if (idx >= (uint)num_points || radii[idx] <= 0) {
@@ -1895,11 +1904,18 @@ kernel void project_and_sh_backward_kernel(
         local_v_cov2d
     );
 
-    // Recompute cov3d from scales+quats (avoids saving/reading 3.6MB tensor)
     float3 exp_scale = exp(read_packed_float3(scales, idx));
     float4 quat = read_packed_float4(quats, idx);
     float local_cov3d[6];
     scale_rot_to_cov3d(exp_scale, glob_scale, quat, local_cov3d);
+
+    float filter_val = filter_3d[idx];
+    if (filter_val > 0.0f) {
+        float filter_sq = 1.0f / (filter_val * filter_val);
+        local_cov3d[0] += filter_sq;
+        local_cov3d[3] += filter_sq;
+        local_cov3d[5] += filter_sq;
+    }
 
     // v_cov3d (thread-local) and v_mean3d contribution
     float tan_fovx = 0.5f * (float)img_size.x / fx;
@@ -4135,4 +4151,27 @@ kernel void bilateral_tv_loss_kernel(
         }
     }
     atomic_fetch_add_explicit(tv_loss, loss_sum * tv_weight, memory_order_relaxed);
+}
+
+kernel void compute_3d_filter_kernel(
+    constant float* means3d       [[buffer(0)]],
+    constant float* viewmat       [[buffer(1)]],
+    constant float2& focal        [[buffer(2)]],
+    device float* filter_3d       [[buffer(3)]],
+    constant int& N               [[buffer(4)]],
+    uint idx [[thread_position_in_grid]]
+) {
+    if (idx >= (uint)N) return;
+
+    float3 p = float3(means3d[idx*3], means3d[idx*3+1], means3d[idx*3+2]);
+    float pz = viewmat[8]*p.x + viewmat[9]*p.y + viewmat[10]*p.z + viewmat[11];
+    if (pz <= 0.01f) return;
+
+    float max_focal = max(focal.x, focal.y);
+    float v_k = max_focal / pz;
+
+    float old_val = filter_3d[idx];
+    if (v_k > old_val) {
+        filter_3d[idx] = v_k;
+    }
 }
